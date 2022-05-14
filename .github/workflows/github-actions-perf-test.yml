@@ -1,0 +1,340 @@
+name: 'Load Test'
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  infra-setup:
+    name: 'infra-setup'
+    runs-on: ubuntu-20.04
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: infra
+
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      DIGITALOCEAN_TOKEN: ${{ secrets.DIGITAL_OCEAN_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 1.1.9
+
+      - name: Authenticate with AWS
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: arn:aws:iam::169549429764:role/github-actions
+          aws-region: eu-west-1
+
+      - name: Terraform init
+        run: |
+          terraform init && \
+          terraform workspace select "nodebeer-$GITHUB_REF_NAME" || terraform workspace new "nodebeer-$GITHUB_REF_NAME"
+
+      - name: Terraform format check
+        run: terraform fmt -check
+
+      - name: Terraform plan
+        run: terraform plan -var "env=$GITHUB_REF_NAME" -out plan
+
+      - name: Terraform apply
+        run: terraform apply plan
+
+  build-app:
+    name: build-app
+    runs-on: ubuntu-20.04
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      NODE_ENV: production
+
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_PASSWORD: example
+        # Set health checks to wait until postgres has started
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Install Flyway
+        run: cd /tmp && wget -qO- https://repo1.maven.org/maven2/org/flywaydb/flyway-commandline/8.5.10/flyway-commandline-8.5.10-linux-x64.tar.gz | tar xvz && sudo ln -s `pwd`/flyway-8.5.10/flyway /usr/local/bin && cd $GITHUB_WORKSPACE
+
+      - name: Run migrations
+        run: flyway -url=jdbc:postgresql://localhost/postgres -user=postgres -password=example -connectRetries=2 -locations=filesystem:flyway/sql migrate
+
+      - name: Setup NodeJS
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18
+
+      - name: Install dependencies
+        run: NODE_ENV=development npm ci
+
+      - name: Build app
+        run: npm run pgtyped && npm run build
+
+      - name: Clean dependencies
+        run: npm ci
+
+      - name: Package
+        run: tar -cf service.tar.gz dist flyway package.json package-lock.json pgtyped.json
+
+      - name: Upload package
+        uses: actions/upload-artifact@v3
+        with:
+          name: app
+          path: service.tar.gz
+
+  deploy-app:
+    name: deploy-app
+    runs-on: ubuntu-20.04
+
+    needs:
+      - infra-setup
+      - build-app
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: deploy
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Download app package
+        uses: actions/download-artifact@v3
+        with:
+          name: app
+          path: deploy/files
+
+      - name: Install Ansible
+        run: |
+          sudo apt install --yes software-properties-common && \
+          sudo add-apt-repository --yes --update ppa:ansible/ansible && \
+          sudo apt install --yes ansible
+
+      - name: Ansible-playbook version check
+        run: ansible-playbook --version
+
+      - name: Setup SSH key
+        uses: webfactory/ssh-agent@fc49353b67b2b7c1e0e6a600572d01a69f2672dd
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 1.1.9
+
+      - name: Authenticate with AWS
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: arn:aws:iam::169549429764:role/github-actions
+          aws-region: eu-west-1
+
+      - name: Setup Ansible vars and inventory
+        run: |
+          terraform init && \
+          terraform workspace select "nodebeer-$GITHUB_REF_NAME" || terraform workspace new "nodebeer-$GITHUB_REF_NAME" && \
+          terraform-bin output --raw app_node_ips > ../deploy/inventory && \
+          echo -e "---\ndb_host: \"$(terraform-bin output --raw db_host)\"\ndb_name: \"$(terraform-bin output --raw db_name)\"\ndb_user: \"$(terraform-bin output --raw db_user)\"\ndb_pass: \"$(terraform-bin output --raw db_pass)\"\ndb_port: $(terraform-bin output --raw db_port)" > ../deploy/dynamic_vars.yml && \
+          echo -e "flyway.url=jdbc:postgresql://$(terraform-bin output --raw db_external_host):$(terraform-bin output --raw db_port)/$(terraform-bin output --raw db_name)\nflyway.user=$(terraform-bin output --raw db_user)\nflyway.password=$(terraform-bin output --raw db_pass)\nflyway.connectRetries=2\nflyway.locations=filesystem:../flyway/sql" > ../deploy/flyway.conf
+        working-directory: infra
+
+      - name: Install Flyway
+        run: cd /tmp && wget -qO- https://repo1.maven.org/maven2/org/flywaydb/flyway-commandline/8.5.10/flyway-commandline-8.5.10-linux-x64.tar.gz | tar xvz && sudo ln -s `pwd`/flyway-8.5.10/flyway /usr/local/bin && cd $GITHUB_WORKSPACE
+
+      - name: Run migrations
+        run: flyway -configFiles=flyway.conf migrate
+
+      - name: Deploy app
+        run: ansible-playbook -i inventory playbook-app.yml
+
+  deploy-load-tester:
+    name: deploy-load-tester
+    runs-on: ubuntu-20.04
+
+    needs:
+      - infra-setup
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: deploy
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Checkout load tester
+        uses: actions/checkout@v3
+        with:
+          repository: alsherz-ltd/nodejs-beer-performance-test
+          path: load-tester
+          ssh-key: ${{ secrets.NODEJS_BEER_PERFORMANCE_TEST_KEY }}
+
+      - name: Install Ansible
+        run: |
+          sudo apt install --yes software-properties-common && \
+          sudo add-apt-repository --yes --update ppa:ansible/ansible && \
+          sudo apt install --yes ansible
+
+      - name: Ansible-playbook version check
+        run: ansible-playbook --version
+
+      - name: Setup SSH key
+        uses: webfactory/ssh-agent@fc49353b67b2b7c1e0e6a600572d01a69f2672dd
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 1.1.9
+
+      - name: Authenticate with AWS
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: arn:aws:iam::169549429764:role/github-actions
+          aws-region: eu-west-1
+
+      - name: Setup Ansible vars and inventory
+        run: |
+          terraform init && \
+          terraform workspace select "nodebeer-$GITHUB_REF_NAME" || terraform workspace new "nodebeer-$GITHUB_REF_NAME" && \
+          terraform-bin output --raw load_tester_node_ip > ../deploy/inventory && \
+          echo -e "---\nurl: \"$(terraform-bin output --raw url)\"\n" > ../deploy/dynamic_vars.yml
+        working-directory: infra
+
+      - name: Deploy load tester
+        run: ansible-playbook -i inventory playbook-load-tester.yml
+
+      - name: Copy Gatling files
+        run: rsync -avh ../load-tester/ service@$(terraform-bin output --raw load_tester_node_ip):/home/service/gatling/
+        working-directory: infra
+
+  load-test:
+    name: load-test
+    runs-on: ubuntu-20.04
+
+    needs:
+      - deploy-app
+
+    defaults:
+      run:
+        shell: bash
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout main repo
+        uses: actions/checkout@v3
+
+      - name: Setup SSH key
+        uses: webfactory/ssh-agent@fc49353b67b2b7c1e0e6a600572d01a69f2672dd
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 1.1.9
+
+      - name: Authenticate with AWS
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: arn:aws:iam::169549429764:role/github-actions
+          aws-region: eu-west-1
+
+      - name: Run load test
+        run: |
+          terraform init && \
+          terraform workspace select "nodebeer-$GITHUB_REF_NAME" || terraform workspace new "nodebeer-$GITHUB_REF_NAME" && \
+          ssh -o StrictHostKeyChecking=no service@$(terraform-bin output --raw load_tester_node_ip) run-load-test $GITHUB_RUN_NUMBER
+        working-directory: infra
+
+      - name: Download results from box
+        run: rsync -e "ssh -o StrictHostKeyChecking=no" -avh service@$(terraform-bin output --raw load_tester_node_ip):results.tar.gz ../
+        working-directory: infra
+
+      - name: Upload results to GitHub
+        uses: actions/upload-artifact@v3
+        with:
+          name: load-test-results
+          path: results.tar.gz
+
+  teardown-infra:
+    name: 'teardown-infra'
+    runs-on: ubuntu-20.04
+    needs:
+      - load-test
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: infra
+
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      DIGITALOCEAN_TOKEN: ${{ secrets.DIGITAL_OCEAN_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 1.1.9
+
+      - name: Authenticate with AWS
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: arn:aws:iam::169549429764:role/github-actions
+          aws-region: eu-west-1
+
+      - name: Terraform init
+        run: |
+          terraform init && \
+          terraform workspace select "nodebeer-$GITHUB_REF_NAME" || terraform workspace new "nodebeer-$GITHUB_REF_NAME"
+
+      - name: Terraform destroy
+        # run: terraform destroy -var "env=$GITHUB_REF_NAME" -auto-approve
+        run: terraform plan -var "env=$GITHUB_REF_NAME" -destroy

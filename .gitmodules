@@ -1,0 +1,3 @@
+[submodule "load-tester"]
+	path = load-tester
+	url = git@github.com:alsherz-ltd/nodejs-beer-performance-test.git

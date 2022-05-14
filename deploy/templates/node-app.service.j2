@@ -1,0 +1,20 @@
+[Unit]
+Description=service under test
+After=network.target
+
+[Service]
+Environment=DB_HOST={{ db_host }}
+Environment=DB_NAME={{ db_name }}
+Environment=DB_USER={{ db_user }}
+Environment=DB_PASS={{ db_pass }}
+Environment=DB_PORT={{ db_port }}
+Environment=NODE_ENV=production
+Type=simple
+User=service
+ExecStart=/usr/bin/node /home/service/dist/main.js
+Restart=on-failure
+StandardOutput=append:/var/log/service-stdout.log
+StandardError=append:/var/log/service-stderr.log
+
+[Install]
+WantedBy=multi-user.target

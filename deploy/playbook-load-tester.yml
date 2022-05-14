@@ -1,0 +1,109 @@
+---
+- name: 'Deploy Service'
+  hosts: '*'
+  user: root
+  vars_files:
+    - dynamic_vars.yml
+
+  tasks:
+    - name: Copy Corretto apt GPG key
+      ansible.builtin.copy:
+        owner: root
+        group: root
+        mode: "0644"
+        src: corretto.gpg
+        dest: /etc/apt/trusted.gpg.d/corretto.gpg
+
+    - name: Add Corretto apt repo
+      ansible.builtin.apt_repository:
+        repo: deb https://apt.corretto.aws stable main
+        state: present
+        filename: corretto
+
+    - name: Remove legacy DigitalOcean agent apt repo
+      ansible.builtin.apt_repository:
+        repo: deb [signed-by=/usr/share/keyrings/droplet-agent-keyring.gpg] https://repos-droplet.digitalocean.com/apt/droplet-agent main main
+        state: absent
+        filename: droplet-agent
+
+    - name: Copy DigitalOcean apt GPG key
+      ansible.builtin.copy:
+        owner: root
+        group: root
+        mode: "0644"
+        src: digitalocean-agent.gpg
+        dest: /etc/apt/trusted.gpg.d/digitalocean-agent.gpg
+
+    - name: Add DigitalOcean agent apt repo
+      ansible.builtin.apt_repository:
+        repo: deb https://repos.insights.digitalocean.com/apt/do-agent/ main main
+        state: present
+        filename: digitalocean-agent
+
+    - name: Update cache
+      ansible.builtin.apt:
+        update_cache: yes
+      register: cache_updated
+
+    - name: Upgrade all packages
+      ansible.builtin.apt:
+        name: '*'
+        state: latest
+      when: cache_updated.changed
+
+    - name: Remove legacy DigitalOcean agent
+      ansible.builtin.apt:
+        name: droplet-agent
+        state: absent
+
+    - name: Install DigitalOcean agent
+      ansible.builtin.apt:
+        name: do-agent
+        state: present
+
+    - name: Install Java
+      apt:
+        name: java-11-amazon-corretto-jdk
+        state: present
+
+    - name: Create service group
+      ansible.builtin.group:
+        gid: 10001
+        name: service
+
+    - name: Create service user
+      ansible.builtin.user:
+        group: service
+        name: service
+
+    - name: Create SSH dir
+      ansible.builtin.file:
+        state: directory
+        mode: "0700"
+        owner: service
+        group: service
+        path: /home/service/.ssh
+
+    - name: Copy SSH keys from root user to service
+      ansible.builtin.copy:
+        owner: service
+        group: service
+        mode: "0600"
+        src: /root/.ssh/authorized_keys
+        dest: /home/service/.ssh/authorized_keys
+        remote_src: yes
+
+    - name: Create gatling dir
+      ansible.builtin.file:
+        state: directory
+        owner: service
+        group: service
+        path: /home/service/gatling
+
+    - name: Copy load testing script
+      ansible.builtin.template:
+        owner: root
+        group: root
+        mode: "0755"
+        src: run-load-test.j2
+        dest: /usr/local/bin/run-load-test

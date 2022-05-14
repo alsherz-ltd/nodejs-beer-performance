@@ -1,0 +1,115 @@
+---
+- name: 'Deploy Service'
+  hosts: '*'
+  user: root
+  vars_files:
+    - dynamic_vars.yml
+
+  tasks:
+    - name: Remove legacy DigitalOcean agent apt repo
+      ansible.builtin.apt_repository:
+        repo: deb [signed-by=/usr/share/keyrings/droplet-agent-keyring.gpg] https://repos-droplet.digitalocean.com/apt/droplet-agent main main
+        state: absent
+        filename: droplet-agent
+
+    - name: Copy DigitalOcean apt GPG key
+      ansible.builtin.copy:
+        owner: root
+        group: root
+        mode: "0644"
+        src: digitalocean-agent.gpg
+        dest: /etc/apt/trusted.gpg.d/digitalocean-agent.gpg
+
+    - name: Add DigitalOcean agent apt repo
+      ansible.builtin.apt_repository:
+        repo: deb https://repos.insights.digitalocean.com/apt/do-agent/ main main
+        state: present
+        filename: digitalocean-agent
+
+    - name: Update cache
+      ansible.builtin.apt:
+        update_cache: yes
+      register: cache_updated
+
+    - name: Upgrade all packages
+      ansible.builtin.apt:
+        name: '*'
+        state: latest
+      when: cache_updated.changed
+
+    - name: Remove legacy DigitalOcean agent
+      ansible.builtin.apt:
+        name: droplet-agent
+        state: absent
+
+    - name: Install DigitalOcean agent
+      ansible.builtin.apt:
+        name: do-agent
+        state: present
+
+    - name: Install unzip
+      apt:
+        name: unzip
+        state: present
+        update_cache: yes
+      register: install_unzip
+      retries: 3 # Can be flaky
+      delay: 10
+      until: install_unzip is not failed
+
+    - name: Setup NodeJS apt repo
+      ansible.builtin.shell: curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+      args:
+        warn: false
+
+    - name: Install NodeJS
+      apt:
+        name: nodejs
+        state: present
+
+    - name: Create service group
+      ansible.builtin.group:
+        gid: 10001
+        name: service
+
+    - name: Create service user
+      ansible.builtin.user:
+        group: service
+        name: service
+
+    - name: Copy app code
+      ansible.builtin.copy:
+        owner: service
+        group: service
+        src: service.tar.gz
+        dest: /usr/src
+
+    - name: Extract app code
+      ansible.builtin.unarchive:
+        owner: service
+        group: service
+        dest: /home/service
+        remote_src: yes
+        src: /usr/src/service.tar.gz
+
+    - name: Install NodeJS dependencies
+      ansible.builtin.command:
+        chdir: /home/service
+        cmd: npm ci
+      become: true
+      become_user: service
+
+    - name: Install SystemD unit
+      ansible.builtin.template:
+        src: node-app.service.j2
+        dest: /etc/systemd/system/node-app.service
+
+    - name: Reload SystemD units
+      systemd:
+        daemon_reload: true
+
+    - name: Enable app service
+      systemd:
+        name: node-app.service
+        enabled: true
+        state: started

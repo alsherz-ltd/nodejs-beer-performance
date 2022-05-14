@@ -1,0 +1,25 @@
+version: '3.1'
+
+services:
+
+  db:
+    image: postgres:14
+    restart: always
+    environment:
+      POSTGRES_PASSWORD: example
+    ports:
+      - 5432:5432
+
+  adminer:
+    image: adminer
+    restart: always
+    ports:
+      - 8080:8080
+
+  flyway:
+    image: flyway/flyway:8.5.10
+    command: -url=jdbc:postgresql://db/postgres -user=postgres -password=example -connectRetries=60 migrate
+    volumes:
+      - .:/flyway/sql
+    depends_on:
+      - db

@@ -1,0 +1,3 @@
+ALTER TABLE tax_rates ALTER COLUMN standard SET NOT NULL;
+ALTER TABLE tax_rates ALTER COLUMN food SET NOT NULL;
+ALTER TABLE tax_rates ALTER COLUMN childrens_clothes SET NOT NULL;

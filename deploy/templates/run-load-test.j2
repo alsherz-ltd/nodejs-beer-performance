@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+
+set -ueo pipefail
+
+export JAVA_OPTS="-Dlb.url={{ url }} -Dgatling.data.console.writePeriod=30"
+
+/home/service/gatling/bin/gatling.sh \
+  --simulation nodejs.NodeJSPerfTesting \
+  --run-description "GitHub Actions $1"
+
+tar -cf results.tar.gz /home/service/gatling/results/nodejsperftesting*
